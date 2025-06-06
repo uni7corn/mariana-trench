@@ -9,6 +9,7 @@
 #include <mariana-trench/Context.h>
 #include <mariana-trench/ExtraTraceSet.h>
 #include <mariana-trench/JsonValidation.h>
+#include <mariana-trench/Log.h>
 #include <mariana-trench/TaintConfig.h>
 
 namespace marianatrench {

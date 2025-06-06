@@ -145,8 +145,14 @@ def _extract_jex_file_if_exists(path: Path, target: str, build_directory: Path) 
         return run_unzip_command(["unzip", "-d", str(jex_extract_directory), str(path)])
 
 
-def _build_target(target: str, *, mode: Optional[str] = None) -> Path:
-    LOG.info(f"Building `{target}`%s...", f" with `{mode}`" if mode else "")
+def _build_target(
+    target: str, *, mode: Optional[str] = None, modifier: Optional[str] = None
+) -> Path:
+    LOG.info(
+        f"Building `{target}`%s%s...",
+        f" with mode `{mode}`" if mode else "",
+        f" with modifier `{modifier}`" if modifier else "",
+    )
 
     # If a target starts with fbcode, then it needs to be built from fbcode instead of from fbsource
     if ":" not in target:
@@ -161,13 +167,17 @@ def _build_target(target: str, *, mode: Optional[str] = None) -> Path:
     command = ["buck2", "build", "--show-json-output"]
     if mode:
         command.append(str(mode))
+    if modifier:
+        command.extend(["--modifier", modifier])
     command.append(target)
+
     current_working_directory = Path(os.getcwd())
     working_directory = (
         current_working_directory / "fbcode"
         if is_fbcode_target
         else current_working_directory
     )
+    LOG.info(f"Running Command: `{' '.join(command)}`")
     output = subprocess.run(command, capture_output=True, cwd=working_directory)
     if output.returncode != 0:
         raise ClientError(
@@ -191,8 +201,10 @@ def _build_target(target: str, *, mode: Optional[str] = None) -> Path:
     return current_working_directory / next(iter(list(response.values())))
 
 
-def _build_executable_target(target: str, *, mode: Optional[str] = None) -> Path:
-    return _check_executable(_build_target(target, mode=mode))
+def _build_executable_target(
+    target: str, *, mode: Optional[str] = None, modifier: Optional[str]
+) -> Path:
+    return _check_executable(_build_target(target, mode=mode, modifier=modifier))
 
 
 def _get_analysis_binary(arguments: argparse.Namespace) -> Path:
@@ -207,7 +219,7 @@ def _get_analysis_binary(arguments: argparse.Namespace) -> Path:
         # Build the mariana-trench binary from buck (facebook-only).
         return _build_executable_target(
             buck_target,
-            mode=arguments.build,
+            modifier=arguments.build,
         )
 
     # pyre-fixme[16]: Module `shim` has no attribute `configuration`.
@@ -342,9 +354,9 @@ def _add_binary_arguments(parser: argparse.ArgumentParser) -> None:
             "--build",
             type=str,
             # pyre-fixme[16]: Module `shim` has no attribute `configuration`.
-            default=none_throws(configuration.BINARY_BUCK_BUILD_MODE),
-            metavar="BUILD_MODE",
-            help="The Mariana Trench binary buck build mode.",
+            default=none_throws(configuration.BINARY_BUCK_BUILD_MODIFIER),
+            metavar="MODIFIER",
+            help="The Mariana Trench binary buck build mode modifier.",
         )
 
 
@@ -378,12 +390,6 @@ def _add_configuration_arguments(parser: argparse.ArgumentParser) -> None:
         type=str,
         default=None,
         help="A `;`-separated list of directories that should be excluded from indexed source files.",
-    )
-    configuration_arguments.add_argument(
-        "--grepo-metadata-path",
-        type=str,
-        default=None,
-        help="A json file containing grepo metadata for source file indexing.",
     )
     configuration_arguments.add_argument(
         "--proguard-configuration-paths",
@@ -508,17 +514,37 @@ def _add_configuration_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_source_indexing_arguments(parser: argparse.ArgumentParser) -> None:
+    source_indexing_arguments = parser.add_argument_group("Source indexing arguments")
+    source_indexing_arguments.add_argument(
+        "--skip-source-indexing",
+        action="store_true",
+        help="Skip indexing source files.",
+    )
+
+    repository_metadata = source_indexing_arguments.add_mutually_exclusive_group(
+        required=False
+    )
+    repository_metadata.add_argument(
+        "--buck-target-metadata-path",
+        type=str,
+        default=None,
+        help="A file containing metadata for source file indexing.",
+    )
+    repository_metadata.add_argument(
+        "--grepo-metadata-path",
+        type=str,
+        default=None,
+        help="A json file containing grepo metadata for source file indexing.",
+    )
+
+
 def _add_analysis_arguments(parser: argparse.ArgumentParser) -> None:
     analysis_arguments = parser.add_argument_group("Analysis arguments")
     analysis_arguments.add_argument(
         "--sequential",
         action="store_true",
         help="Run the analysis sequentially, one a single thread.",
-    )
-    analysis_arguments.add_argument(
-        "--skip-source-indexing",
-        action="store_true",
-        help="Skip indexing source files.",
     )
     analysis_arguments.add_argument(
         "--skip-analysis",
@@ -586,6 +612,9 @@ def _add_debug_arguments(parser: argparse.ArgumentParser) -> None:
     )
     debug_arguments.add_argument(
         "--lldb", action="store_true", help="Run the analyzer inside lldb."
+    )
+    debug_arguments.add_argument(
+        "--fdb", action="store_true", help="Run the analyzer inside fdb."
     )
     debug_arguments.add_argument(
         "--log-method",
@@ -669,6 +698,16 @@ def _set_environment_variables(arguments: argparse.Namespace) -> None:
     if "TRACE" in os.environ:
         trace_settings.insert(0, os.environ["TRACE"])
     os.environ["TRACE"] = ",".join(trace_settings)
+
+
+def _str_to_bool(value: str) -> Optional[bool]:
+    value = value.lower()
+    if value == "true":
+        return True
+    elif value == "false":
+        return False
+    else:
+        return None
 
 
 def _get_command_options_json(
@@ -788,8 +827,11 @@ def _get_command_options_json(
             ):
                 # Append the values to the existing list
                 options[key].extend(value)
+            elif (bool_value := _str_to_bool(value)) is not None:
+                # Override the existing value (if any)
+                options[key] = bool_value
             else:
-                # Override the value
+                # Override the existing value (if any)
                 options[key] = value
 
     if arguments.job_id:
@@ -862,6 +904,7 @@ def main() -> None:
         _add_binary_arguments(parser)
         _add_configuration_arguments(parser)
         _add_analysis_arguments(parser)
+        _add_source_indexing_arguments(parser)
         _add_metadata_arguments(parser)
         _add_debug_arguments(parser)
         parser.add_argument(
@@ -959,7 +1002,9 @@ def main() -> None:
                 binary, arguments, apk_directory, dex_directory
             )
         else:
-            with tempfile.NamedTemporaryFile(suffix=".json", mode="w") as options_file:
+            with tempfile.NamedTemporaryFile(
+                suffix=".json", mode="w", delete=False
+            ) as options_file:
                 _set_environment_variables(arguments)
                 options_json = _get_command_options_json(
                     arguments, apk_directory, dex_directory
@@ -971,6 +1016,8 @@ def main() -> None:
                     command = ["gdb", "--args"] + command
                 elif arguments.lldb:
                     command = ["lldb", "--"] + command
+                elif arguments.fdb:
+                    command = ["fdb", "--launch-mode=vscode", "debug", "--"] + command
                 LOG.info(f"Running Mariana Trench: {' '.join(command)}")
                 output = subprocess.run(command)
         if output.returncode != 0:
